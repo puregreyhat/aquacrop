@@ -168,13 +168,16 @@ class TelegramFarmBridge {
     final chatId = state.ownerChatId;
     if (chatId == null || !state.alertsEnabled) return;
 
-    for (final message in alerts.evaluate(value)) {
-      unawaited(
-        telegram.sendMessage(chatId, message).catchError((Object _) {
-          stderr.writeln('Could not send a Telegram alert.');
-        }),
-      );
-    }
+    final messages = alerts.evaluate(value);
+    if (messages.isEmpty) return;
+    unawaited(
+      telegram.sendMessage(chatId, messages.join('\n\n')).catchError((
+        Object _,
+      ) {
+        alerts.reset();
+        stderr.writeln('Could not send a Telegram alert; will retry.');
+      }),
+    );
   }
 }
 
