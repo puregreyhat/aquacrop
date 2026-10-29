@@ -3,24 +3,36 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import 'demo_page.dart';
 import 'farm_data.dart';
+import 'local_secrets.dart';
 import 'mqtt_farm_service.dart';
+import 'weather_service.dart';
 
 void main() => runApp(const SmartAgriApp());
 
 FarmService createFarmService() {
-  const username = String.fromEnvironment('MQTT_USERNAME');
-  const password = String.fromEnvironment('MQTT_PASSWORD');
+  const environmentUsername = String.fromEnvironment('MQTT_USERNAME');
+  const environmentPassword = String.fromEnvironment('MQTT_PASSWORD');
+  final username = environmentUsername.isEmpty
+      ? localMqttUsername
+      : environmentUsername;
+  final password = environmentPassword.isEmpty
+      ? localMqttPassword
+      : environmentPassword;
   if (username.isEmpty || password.isEmpty) return DemoFarmService();
   return MqttFarmService(
-    host: '8255d88bbacc45fd89c2580a5887a138.s1.eu.hivemq.cloud',
+    host: '6356f8b40c434ceea40f3ba7d1954153.s1.eu.hivemq.cloud',
     username: username,
     password: password,
   );
 }
 
 class SmartAgriApp extends StatelessWidget {
-  const SmartAgriApp({super.key});
+  const SmartAgriApp({super.key, this.service, this.weatherLoader});
+
+  final FarmService? service;
+  final Future<LocalWeather> Function()? weatherLoader;
 
   @override
   Widget build(BuildContext context) => MaterialApp(
@@ -43,7 +55,11 @@ class SmartAgriApp extends StatelessWidget {
         ),
       ),
     ),
-    home: FarmShell(service: createFarmService()),
+    routes: {'/demo': (_) => const DemoPage()},
+    home: FarmShell(
+      service: service ?? createFarmService(),
+      weatherLoader: weatherLoader ?? () => WeatherLocationService().load(),
+    ),
   );
 }
 
@@ -65,8 +81,13 @@ enum AppPage {
 }
 
 class FarmShell extends StatefulWidget {
-  const FarmShell({super.key, required this.service});
+  const FarmShell({
+    super.key,
+    required this.service,
+    required this.weatherLoader,
+  });
   final FarmService service;
+  final Future<LocalWeather> Function() weatherLoader;
 
   @override
   State<FarmShell> createState() => _FarmShellState();
@@ -77,6 +98,9 @@ class _FarmShellState extends State<FarmShell> {
   FarmSnapshot? data;
   bool automatic = true;
   bool changingPump = false;
+  bool weatherLoading = true;
+  LocalWeather? localWeather;
+  String? weatherError;
   StreamSubscription<FarmSnapshot>? subscription;
 
   static const mobilePages = [
@@ -95,6 +119,7 @@ class _FarmShellState extends State<FarmShell> {
     widget.service.read().then((value) {
       if (mounted) setState(() => data = value);
     });
+    loadWeather();
   }
 
   @override
@@ -121,6 +146,33 @@ class _FarmShellState extends State<FarmShell> {
         duration: const Duration(seconds: 2),
       ),
     );
+  }
+
+  Future<void> loadWeather() async {
+    setState(() {
+      weatherLoading = true;
+      weatherError = null;
+    });
+    try {
+      final result = await widget.weatherLoader();
+      if (!mounted) return;
+      setState(() {
+        localWeather = result;
+        weatherLoading = false;
+      });
+    } on WeatherLocationException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        weatherError = error.message;
+        weatherLoading = false;
+      });
+    } on Object {
+      if (!mounted) return;
+      setState(() {
+        weatherError = 'Could not load your location and weather.';
+        weatherLoading = false;
+      });
+    }
   }
 
   void select(AppPage value) {
@@ -223,6 +275,10 @@ class _FarmShellState extends State<FarmShell> {
       data: snapshot,
       onPump: togglePump,
       busy: changingPump,
+      weather: localWeather,
+      weatherLoading: weatherLoading,
+      weatherError: weatherError,
+      onWeatherRefresh: loadWeather,
     ),
     AppPage.zones => ZonesPage(data: snapshot),
     AppPage.live => LiveDataPage(data: snapshot),
@@ -419,10 +475,18 @@ class DashboardPage extends StatelessWidget {
     required this.data,
     required this.onPump,
     required this.busy,
+    required this.weather,
+    required this.weatherLoading,
+    required this.weatherError,
+    required this.onWeatherRefresh,
   });
   final FarmSnapshot data;
   final VoidCallback onPump;
   final bool busy;
+  final LocalWeather? weather;
+  final bool weatherLoading;
+  final String? weatherError;
+  final VoidCallback onWeatherRefresh;
 
   @override
   Widget build(BuildContext context) => Column(
@@ -433,6 +497,13 @@ class DashboardPage extends StatelessWidget {
         subtitle: 'Detailed farm performance and sensor telemetry.',
       ),
       const SizedBox(height: 20),
+      LocationWeatherCard(
+        weather: weather,
+        loading: weatherLoading,
+        error: weatherError,
+        onRefresh: onWeatherRefresh,
+      ),
+      const SizedBox(height: 18),
       ResponsiveGrid(
         columns: MediaQuery.sizeOf(context).width > 1180 ? 4 : 2,
         children: [
@@ -524,6 +595,233 @@ class DashboardPage extends StatelessWidget {
     ],
   );
 }
+
+class LocationWeatherCard extends StatelessWidget {
+  const LocationWeatherCard({
+    super.key,
+    required this.weather,
+    required this.loading,
+    required this.error,
+    required this.onRefresh,
+  });
+
+  final LocalWeather? weather;
+  final bool loading;
+  final String? error;
+  final VoidCallback onRefresh;
+
+  @override
+  Widget build(BuildContext context) {
+    if (loading) {
+      return const AppCard(
+        child: Row(
+          children: [
+            SizedBox(
+              width: 28,
+              height: 28,
+              child: CircularProgressIndicator(strokeWidth: 3),
+            ),
+            SizedBox(width: 16),
+            Expanded(
+              child: Text(
+                'Finding your location and loading local weather…',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final current = weather;
+    if (current == null) {
+      return AppCard(
+        child: Row(
+          children: [
+            const Icon(
+              Icons.location_off_rounded,
+              color: Color(0xFFDC5656),
+              size: 34,
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(
+                error ?? 'Local weather is unavailable.',
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+            TextButton.icon(
+              onPressed: onRefresh,
+              icon: const Icon(Icons.refresh_rounded),
+              label: const Text('Retry'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final place = current.region.isEmpty
+        ? current.location
+        : '${current.location}, ${current.region}';
+    return AppCard(
+      child: LayoutBuilder(
+        builder: (context, box) {
+          final wide = box.maxWidth >= 760;
+          final summary = Row(
+            children: [
+              Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFFF4CF),
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: Icon(
+                  _weatherIcon(current.weatherCode),
+                  color: const Color(0xFFF2A900),
+                  size: 36,
+                ),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.location_on_rounded,
+                          size: 18,
+                          color: Color(0xFF15966A),
+                        ),
+                        const SizedBox(width: 4),
+                        Expanded(
+                          child: Text(
+                            place,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w800,
+                              fontSize: 18,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 5),
+                    Text(
+                      '${current.temperature.toStringAsFixed(1)}°C · '
+                      '${current.condition}',
+                      style: const TextStyle(
+                        fontSize: 25,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                    Text(
+                      '${current.latitude.toStringAsFixed(4)}, '
+                      '${current.longitude.toStringAsFixed(4)} · '
+                      'feels like ${current.apparentTemperature.toStringAsFixed(1)}°C',
+                      style: const TextStyle(color: Color(0xFF667870)),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                tooltip: 'Refresh location and weather',
+                onPressed: onRefresh,
+                icon: const Icon(Icons.refresh_rounded),
+              ),
+            ],
+          );
+          final facts = Wrap(
+            spacing: 22,
+            runSpacing: 14,
+            children: [
+              _WeatherFact(
+                icon: Icons.umbrella_rounded,
+                label: 'Rain next 24h',
+                value: '${current.rainProbability}%',
+              ),
+              _WeatherFact(
+                icon: Icons.water_drop_rounded,
+                label: 'Outdoor humidity',
+                value: '${current.humidity}%',
+              ),
+              _WeatherFact(
+                icon: Icons.air_rounded,
+                label: 'Wind',
+                value: '${current.windSpeed.toStringAsFixed(1)} km/h',
+              ),
+              _WeatherFact(
+                icon: Icons.grain_rounded,
+                label: 'Precipitation now',
+                value: '${current.precipitation.toStringAsFixed(1)} mm',
+              ),
+            ],
+          );
+
+          return Flex(
+            direction: wide ? Axis.horizontal : Axis.vertical,
+            crossAxisAlignment: wide
+                ? CrossAxisAlignment.center
+                : CrossAxisAlignment.start,
+            children: [
+              ExpandedIf(enabled: wide, flex: 3, child: summary),
+              SizedBox(width: wide ? 28 : 0, height: wide ? 0 : 20),
+              ExpandedIf(enabled: wide, flex: 2, child: facts),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _WeatherFact extends StatelessWidget {
+  const _WeatherFact({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: 132,
+    child: Row(
+      children: [
+        Icon(icon, color: const Color(0xFF15966A), size: 22),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: const TextStyle(color: Color(0xFF667870), fontSize: 12),
+              ),
+              Text(value, style: const TextStyle(fontWeight: FontWeight.w800)),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+IconData _weatherIcon(int code) => switch (code) {
+  0 => Icons.wb_sunny_rounded,
+  1 || 2 => Icons.wb_cloudy_rounded,
+  3 => Icons.cloud_rounded,
+  45 || 48 => Icons.foggy,
+  >= 51 && <= 82 => Icons.umbrella_rounded,
+  >= 85 && <= 86 => Icons.ac_unit_rounded,
+  >= 95 => Icons.thunderstorm_rounded,
+  _ => Icons.cloud_queue_rounded,
+};
 
 class ZonesPage extends StatelessWidget {
   const ZonesPage({super.key, required this.data});

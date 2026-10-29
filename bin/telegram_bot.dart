@@ -3,9 +3,10 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:smart_agri/farm_data.dart';
+import 'package:smart_agri/local_secrets.dart';
 import 'package:smart_agri/mqtt_farm_service.dart';
 
-const _mqttHost = '8255d88bbacc45fd89c2580a5887a138.s1.eu.hivemq.cloud';
+const _mqttHost = '6356f8b40c434ceea40f3ba7d1954153.s1.eu.hivemq.cloud';
 const _soilAlertPercent = 35;
 const _tankAlertPercent = 20;
 const _heatAlertCelsius = 38.0;
@@ -17,20 +18,41 @@ Future<void> main(List<String> arguments) async {
   }
 
   final environment = Platform.environment;
-  final token = _required(environment, 'TELEGRAM_BOT_TOKEN');
-  final mqttUsername = _required(environment, 'MQTT_USERNAME');
-  final mqttPassword = _required(environment, 'MQTT_PASSWORD');
+  final token = _setting(
+    environment,
+    'TELEGRAM_BOT_TOKEN',
+    localTelegramBotToken,
+  );
+  final mqttUsername = _setting(
+    environment,
+    'MQTT_USERNAME',
+    localMqttUsername,
+  );
+  final mqttPassword = _setting(
+    environment,
+    'MQTT_PASSWORD',
+    localMqttPassword,
+  );
+
   final stateFile = File(
     environment['TELEGRAM_STATE_FILE'] ?? '.telegram_bot_state.json',
   );
 
+  final telegram = TelegramApi(token);
+  final farm = MqttFarmService(
+    host: _mqttHost,
+    username: mqttUsername,
+    password: mqttPassword,
+  );
+
+  if (arguments.contains('--check')) {
+    await checkConnections(telegram, farm);
+    return;
+  }
+
   final bridge = TelegramFarmBridge(
-    telegram: TelegramApi(token),
-    farm: MqttFarmService(
-      host: _mqttHost,
-      username: mqttUsername,
-      password: mqttPassword,
-    ),
+    telegram: telegram,
+    farm: farm,
     stateFile: stateFile,
   );
 
@@ -38,14 +60,54 @@ Future<void> main(List<String> arguments) async {
   await bridge.run();
 }
 
-String _required(Map<String, String> environment, String name) {
-  final value = environment[name]?.trim() ?? '';
-  if (value.isEmpty) {
-    stderr.writeln('Missing required environment variable: $name');
-    exitCode = 64;
-    throw StateError(name);
+String _setting(Map<String, String> environment, String name, String fallback) {
+  final value = environment[name]?.trim();
+  return value == null || value.isEmpty ? fallback : value;
+}
+
+Future<void> checkConnections(
+  TelegramApi telegram,
+  MqttFarmService farm,
+) async {
+  var farmOpened = false;
+  try {
+    final botName = await telegram.getBotName();
+    stdout.writeln('✓ Telegram API connected: @$botName');
+
+    farmOpened = true;
+    final initial = await farm.read();
+    if (!initial.connected) {
+      stderr.writeln('✗ HiveMQ connection failed. Check MQTT credentials.');
+      exitCode = 1;
+      return;
+    }
+    stdout.writeln('✓ HiveMQ connected; waiting for ESP32 telemetry...');
+
+    try {
+      final sample = await farm.updates.first.timeout(
+        const Duration(seconds: 15),
+      );
+      stdout.writeln('✓ Live ESP32 packet received:');
+      stdout.writeln(formatStatus(sample));
+    } on TimeoutException {
+      stderr.writeln(
+        '✗ No ESP32 packet arrived within 15 seconds. Check that the board is '
+        'online and publishing to smartfarm/esp32-s3/telemetry.',
+      );
+      exitCode = 1;
+    }
+  } on TelegramApiException catch (error) {
+    stderr.writeln('✗ Telegram API failed: ${error.message}');
+    exitCode = 1;
+  } on Object {
+    stderr.writeln(
+      '✗ Connection check failed. Verify network and credentials.',
+    );
+    exitCode = 1;
+  } finally {
+    if (farmOpened) await farm.close();
+    telegram.close();
   }
-  return value;
 }
 
 class TelegramFarmBridge {
@@ -275,6 +337,15 @@ class TelegramApi {
   final String token;
   final HttpClient _http = HttpClient();
 
+  Future<String> getBotName() async {
+    final response = await _call('getMe', const {});
+    final result = response['result'];
+    if (result is! Map<String, dynamic> || result['username'] is! String) {
+      throw const TelegramApiException('Bot username missing');
+    }
+    return result['username'] as String;
+  }
+
   Future<List<Map<String, dynamic>>> getUpdates(int offset) async {
     final response = await _call('getUpdates', {
       'offset': offset,
@@ -323,6 +394,8 @@ class TelegramApi {
     }
     return json;
   }
+
+  void close() => _http.close(force: true);
 }
 
 class TelegramApiException implements Exception {
@@ -339,6 +412,10 @@ const _welcomeMessage =
     '/help — show this message';
 
 Future<void> _selfTest() async {
+  assert(_setting(const {}, 'TEST', 'fallback') == 'fallback');
+  assert(
+    _setting(const {'TEST': 'override'}, 'TEST', 'fallback') == 'override',
+  );
   assert(parseCommand('/STATUS@AquaCropBot now') == 'status');
   assert(parseCommand('hello') == null);
 

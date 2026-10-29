@@ -9,23 +9,26 @@ import 'mqtt_transport.dart';
 FarmSnapshot applyTelemetry(FarmSnapshot current, Map<String, dynamic> json) {
   final soilRaw = _integer(json['soilRaw']);
   final waterRaw = _integer(json['waterLevelRaw']);
+  final soilMoisture =
+      _integerOrNull(json['soilMoisture']) ??
+      (((2050 - soilRaw) / (2050 - 1000)) * 100).round().clamp(0, 100);
+  final waterLevel =
+      _integerOrNull(json['waterLevel']) ??
+      (waterRaw / 3000 * 100).round().clamp(0, 100);
   final zones = [...current.zones];
-  zones[0] = zones[0].copyWith(
-    moisture: (((3200 - soilRaw) / (3200 - 1300)) * 100).round().clamp(0, 100),
-    live: true,
-  );
+  zones[0] = zones[0].copyWith(moisture: soilMoisture, live: true);
   zones[1] = zones[1].copyWith(live: false);
   return current.copyWith(
     zones: zones,
-    temperature: _number(json['temperature']),
-    humidity: _number(json['humidity']),
-    tankLevel: (waterRaw / 4095 * 100).round().clamp(0, 100),
+    temperature: _number(json['temperature'], fallback: current.temperature),
+    humidity: _number(json['humidity'], fallback: current.humidity),
+    tankLevel: waterLevel,
     soilRaw: soilRaw,
     waterLevelRaw: waterRaw,
     flowPulses: _integer(json['flowPulses']),
     sampleIntervalMs: _integer(json['intervalMs'], fallback: 2500),
     raining: json['raining'] == true,
-    pumpOn: json['pumpOn'] == true,
+    pumpOn: json['pumpOn'] is bool ? json['pumpOn'] as bool : current.pumpOn,
     connected: true,
     pumpControlAvailable: true,
     lastUpdated: DateTime.now(),
@@ -35,8 +38,10 @@ FarmSnapshot applyTelemetry(FarmSnapshot current, Map<String, dynamic> json) {
 int _integer(Object? value, {int fallback = 0}) =>
     value is num ? value.round() : fallback;
 
-double _number(Object? value) =>
-    value is num && value.isFinite ? value.toDouble() : 0;
+int? _integerOrNull(Object? value) => value is num ? value.round() : null;
+
+double _number(Object? value, {double fallback = 0}) =>
+    value is num && value.isFinite ? value.toDouble() : fallback;
 
 class MqttFarmService implements FarmService {
   MqttFarmService({
